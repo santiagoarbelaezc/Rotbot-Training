@@ -113,12 +113,6 @@ def find_default_sql_file(base_dir: Optional[str] = None) -> Optional[str]:
 def parse_sql_inserts(sql_content_or_path: str) -> List[Dict[str, Any]]:
     """
     Extracts column names and rows from SQL INSERT INTO statements robustly.
-    
-    Args:
-        sql_content_or_path: String containing raw SQL statements or path to a .sql file.
-        
-    Returns:
-        List of dictionaries representing extracted records.
     """
     if os.path.exists(sql_content_or_path):
         with open(sql_content_or_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -137,7 +131,6 @@ def parse_sql_inserts(sql_content_or_path: str) -> List[Dict[str, Any]]:
 
     records = []
 
-    # Match each INSERT INTO statement
     insert_pattern = re.compile(
         r'INSERT\s+INTO\s+[`"]?(\w+)[`"]?\s*(?:\(([^)]+)\))?\s*VALUES\s*(.+?);',
         re.IGNORECASE | re.DOTALL
@@ -151,12 +144,10 @@ def parse_sql_inserts(sql_content_or_path: str) -> List[Dict[str, Any]]:
         if raw_cols:
             cols = [c.strip().strip('`"\' ') for c in raw_cols.split(',')]
 
-        # Tokenize tuple rows with full quote-aware state machine
         i = 0
         block_len = len(raw_values_block)
 
         while i < block_len:
-            # Advance to opening paren of tuple
             while i < block_len and raw_values_block[i] != '(':
                 i += 1
             if i >= block_len:
@@ -209,7 +200,6 @@ def parse_sql_inserts(sql_content_or_path: str) -> List[Dict[str, Any]]:
 def sql_to_dataframe(sql_content_or_path: str) -> pd.DataFrame:
     """
     Parses SQL inserts and converts them into a standardized pandas DataFrame.
-    Automatically standardizes column names.
     """
     records = parse_sql_inserts(sql_content_or_path)
     if not records:
@@ -217,7 +207,6 @@ def sql_to_dataframe(sql_content_or_path: str) -> pd.DataFrame:
 
     df = pd.DataFrame(records)
 
-    # Column mapping heuristics
     col_mapping = {}
     for col in df.columns:
         col_lower = str(col).lower().strip()
@@ -236,6 +225,63 @@ def sql_to_dataframe(sql_content_or_path: str) -> pd.DataFrame:
 
     df = df.rename(columns=col_mapping)
     return df
+
+
+def stratified_split(
+    df: pd.DataFrame,
+    val_ratio: float = 0.2,
+    stratify_cols: Optional[List[str]] = None,
+    seed: int = 42
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Performs a balanced, stratified train/validation split using single or multiple columns (e.g. category + level).
+    Falls back gracefully if group sizes are too small.
+    """
+    if df.empty:
+        return df, df
+
+    cols_to_use = [c for c in (stratify_cols or ['category', 'level']) if c in df.columns]
+    
+    if not cols_to_use:
+        shuffled = df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+        val_size = int(len(shuffled) * val_ratio)
+        return shuffled.iloc[val_size:].reset_index(drop=True), shuffled.iloc[:val_size].reset_index(drop=True)
+
+    # Create composite stratification key
+    df_work = df.copy()
+    df_work['_strat_key'] = df_work[cols_to_use].astype(str).agg('_'.join, axis=1)
+
+    train_indices = []
+    val_indices = []
+
+    rng = random.Random(seed)
+
+    for _, group in df_work.groupby('_strat_key'):
+        indices = group.index.tolist()
+        rng.shuffle(indices)
+        n_val = max(1, int(round(len(indices) * val_ratio))) if len(indices) >= 4 else (1 if rng.random() < val_ratio else 0)
+        n_val = min(n_val, len(indices) - 1) if len(indices) > 1 else 0
+
+        val_indices.extend(indices[:n_val])
+        train_indices.extend(indices[n_val:])
+
+    # If rounding caused exact ratio discrepancy, adjust slightly
+    target_val = int(round(len(df) * val_ratio))
+    if len(val_indices) > target_val:
+        diff = len(val_indices) - target_val
+        move = val_indices[:diff]
+        val_indices = val_indices[diff:]
+        train_indices.extend(move)
+    elif len(val_indices) < target_val:
+        diff = target_val - len(val_indices)
+        move = train_indices[:diff]
+        train_indices = train_indices[diff:]
+        val_indices.extend(move)
+
+    train_df = df.loc[train_indices].sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    val_df = df.loc[val_indices].sample(frac=1.0, random_state=seed).reset_index(drop=True)
+
+    return train_df, val_df
 
 
 def build_chatml_record(
@@ -291,12 +337,13 @@ def sql_to_jsonl(
     output_train_path: str,
     output_val_path: str,
     val_ratio: float = 0.2,
+    stratify: bool = True,
     system_prompt: Optional[str] = None,
     format_type: str = "chatml",
     seed: int = 42
 ) -> Tuple[int, int]:
     """
-    Complete pipeline to parse SQL, convert to training format, split, and save to train.jsonl and val.jsonl.
+    Complete pipeline to parse SQL, perform stratified split, convert to training format, and save to JSONL files.
     """
     df = sql_to_dataframe(sql_path)
     if df.empty:
@@ -314,45 +361,44 @@ def sql_to_jsonl(
     df['assistant_message'] = df['assistant_message'].astype(str).str.strip()
     df = df[(df['user_message'] != '') & (df['assistant_message'] != '')]
 
-    records = []
-    for _, row in df.iterrows():
-        user_msg = row['user_message']
-        asst_msg = row['assistant_message']
-        # If the row has its own system_prompt, use it; otherwise fallback to custom or DEFAULT
-        sys_msg = row.get('system_prompt')
-        if not sys_msg or pd.isna(sys_msg) or str(sys_msg).strip() == '':
-            sys_msg = system_prompt or DEFAULT_SYSTEM_PROMPT
+    if stratify:
+        train_df, val_df = stratified_split(df, val_ratio=val_ratio, seed=seed)
+    else:
+        shuffled = df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+        val_size = int(len(shuffled) * val_ratio)
+        val_df = shuffled.iloc[:val_size]
+        train_df = shuffled.iloc[val_size:]
 
-        meta = {}
-        if 'category' in row and pd.notna(row['category']):
-            meta['category'] = str(row['category'])
-        if 'level' in row and pd.notna(row['level']):
-            meta['level'] = str(row['level'])
-        if 'notes' in row and pd.notna(row['notes']):
-            meta['error_targeted'] = str(row['notes'])
-        if 'id' in row and pd.notna(row['id']):
-            meta['id'] = str(row['id'])
+    def _df_to_records(subset_df: pd.DataFrame) -> List[Dict[str, Any]]:
+        records = []
+        for _, row in subset_df.iterrows():
+            user_msg = row['user_message']
+            asst_msg = row['assistant_message']
+            sys_msg = row.get('system_prompt')
+            if not sys_msg or pd.isna(sys_msg) or str(sys_msg).strip() == '':
+                sys_msg = system_prompt or DEFAULT_SYSTEM_PROMPT
 
-        if format_type == "gemini":
-            rec = build_gemini_tuning_record(user_msg, asst_msg, sys_msg)
-        else:
-            rec = build_chatml_record(user_msg, asst_msg, sys_msg, metadata=meta if meta else None)
+            meta = {}
+            if 'category' in row and pd.notna(row['category']):
+                meta['category'] = str(row['category'])
+            if 'level' in row and pd.notna(row['level']):
+                meta['level'] = str(row['level'])
+            if 'notes' in row and pd.notna(row['notes']):
+                meta['error_targeted'] = str(row['notes'])
+            if 'id' in row and pd.notna(row['id']):
+                meta['id'] = str(row['id'])
 
-        records.append(rec)
+            if format_type == "gemini":
+                rec = build_gemini_tuning_record(user_msg, asst_msg, sys_msg)
+            else:
+                rec = build_chatml_record(user_msg, asst_msg, sys_msg, metadata=meta if meta else None)
 
-    # Shuffle with seed
-    random.seed(seed)
-    random.shuffle(records)
+            records.append(rec)
+        return records
 
-    # Split train / val
-    num_total = len(records)
-    num_val = int(num_total * val_ratio)
-    num_train = num_total - num_val
+    train_data = _df_to_records(train_df)
+    val_data = _df_to_records(val_df)
 
-    train_data = records[:num_train]
-    val_data = records[num_train:]
-
-    # Ensure output directories exist
     os.makedirs(os.path.dirname(os.path.abspath(output_train_path)), exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(output_val_path)), exist_ok=True)
 

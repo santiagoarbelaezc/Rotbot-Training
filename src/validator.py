@@ -1,12 +1,47 @@
 """
 Rotbot Training - Dataset Validator Module
-Validates message formatting, role alternation, token statistics, and structural integrity of JSONL datasets.
+Validates message formatting, role alternation, token statistics, style compliance, and structural integrity.
 """
 
 import os
+import re
 import json
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Union
 from collections import Counter
+import pandas as pd
+
+
+# Unicode range regex to detect emojis reliably
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"  # emoticons
+    "\U0001F300-\U0001F5FF"  # symbols & pictographs
+    "\U0001F680-\U0001F6FF"  # transport & map symbols
+    "\U0001F700-\U0001F77F"  # alchemical symbols
+    "\U0001F780-\U0001F7FF"  # Geometric Shapes Extended
+    "\U0001F800-\U0001F8FF"  # Supplemental Arrows-C
+    "\U0001F900-\U0001F9FF"  # Supplemental Symbols and Pictographs
+    "\U0001FA00-\U0001FA6F"  # Chess Symbols
+    "\U0001FA70-\U0001FAFF"  # Symbols and Pictographs Extended-A
+    "\U00002702-\U000027B0"  # Dingbats
+    "\U000024C2-\U0001F251"
+    "]+",
+    flags=re.UNICODE
+)
+
+
+def has_emojis(text: str) -> bool:
+    """Returns True if the text contains any emoji character."""
+    if not text:
+        return False
+    return bool(EMOJI_PATTERN.search(text))
+
+
+def extract_emojis(text: str) -> List[str]:
+    """Returns a list of emojis found in the text."""
+    if not text:
+        return []
+    return EMOJI_PATTERN.findall(text)
 
 
 def estimate_tokens(text: str) -> int:
@@ -21,22 +56,131 @@ def estimate_tokens(text: str) -> int:
         enc = tiktoken.get_encoding("cl100k_base")
         return len(enc.encode(text))
     except Exception:
-        # Fallback estimation heuristic
         words = len(text.split())
         chars = len(text)
         return max(words, int(chars / 4.0))
 
 
+def compute_detailed_token_stats(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Computes comprehensive lexical and token statistics for a DataFrame with user_message and assistant_message.
+    """
+    if df.empty or 'user_message' not in df.columns or 'assistant_message' not in df.columns:
+        return {}
+
+    user_tokens = df['user_message'].astype(str).apply(estimate_tokens)
+    asst_tokens = df['assistant_message'].astype(str).apply(estimate_tokens)
+    total_tokens = user_tokens + asst_tokens
+
+    user_words = df['user_message'].astype(str).apply(lambda x: len(x.split()))
+    asst_words = df['assistant_message'].astype(str).apply(lambda x: len(x.split()))
+
+    user_chars = df['user_message'].astype(str).apply(len)
+    asst_chars = df['assistant_message'].astype(str).apply(len)
+
+    stats = {
+        "count": len(df),
+        "user_tokens": {
+            "mean": round(float(user_tokens.mean()), 1),
+            "median": round(float(user_tokens.median()), 1),
+            "min": int(user_tokens.min()),
+            "max": int(user_tokens.max()),
+            "p25": round(float(user_tokens.quantile(0.25)), 1),
+            "p75": round(float(user_tokens.quantile(0.75)), 1),
+            "sum": int(user_tokens.sum())
+        },
+        "assistant_tokens": {
+            "mean": round(float(asst_tokens.mean()), 1),
+            "median": round(float(asst_tokens.median()), 1),
+            "min": int(asst_tokens.min()),
+            "max": int(asst_tokens.max()),
+            "p25": round(float(asst_tokens.quantile(0.25)), 1),
+            "p75": round(float(asst_tokens.quantile(0.75)), 1),
+            "sum": int(asst_tokens.sum())
+        },
+        "total_tokens": {
+            "mean": round(float(total_tokens.mean()), 1),
+            "median": round(float(total_tokens.median()), 1),
+            "min": int(total_tokens.min()),
+            "max": int(total_tokens.max()),
+            "p25": round(float(total_tokens.quantile(0.25)), 1),
+            "p75": round(float(total_tokens.quantile(0.75)), 1),
+            "sum": int(total_tokens.sum())
+        },
+        "words": {
+            "user_mean": round(float(user_words.mean()), 1),
+            "asst_mean": round(float(asst_words.mean()), 1),
+            "total_mean": round(float((user_words + asst_words).mean()), 1)
+        },
+        "chars": {
+            "user_mean": round(float(user_chars.mean()), 1),
+            "asst_mean": round(float(asst_chars.mean()), 1)
+        },
+        "asst_to_user_token_ratio": round(float(asst_tokens.mean() / max(user_tokens.mean(), 1)), 2)
+    }
+    return stats
+
+
+def check_rotbot_style_compliance(df_or_records: Union[pd.DataFrame, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """
+    Audits RotBot personality compliance:
+    1. Presence of 'boss' in assistant responses.
+    2. Strict absence of emojis.
+    3. English response verification.
+    """
+    if isinstance(df_or_records, list):
+        df = pd.DataFrame(df_or_records)
+    else:
+        df = df_or_records.copy()
+
+    if df.empty:
+        return {"total": 0, "boss_compliance_pct": 0.0, "emoji_free_pct": 100.0, "issues": []}
+
+    target_col = "assistant_message"
+    if target_col not in df.columns:
+        for c in ["bot_response", "response", "output"]:
+            if c in df.columns:
+                target_col = c
+                break
+
+    total = len(df)
+    boss_matches = 0
+    emoji_violations = []
+    missing_boss_indices = []
+
+    for idx, text in enumerate(df[target_col].astype(str)):
+        t_lower = text.lower()
+        if re.search(r'\bboss\b', t_lower):
+            boss_matches += 1
+        else:
+            missing_boss_indices.append(idx)
+
+        if has_emojis(text):
+            found = extract_emojis(text)
+            emoji_violations.append((idx, found))
+
+    boss_pct = round((boss_matches / max(total, 1)) * 100, 2)
+    emoji_free_pct = round(((total - len(emoji_violations)) / max(total, 1)) * 100, 2)
+
+    return {
+        "total_evaluated": total,
+        "boss_count": boss_matches,
+        "boss_compliance_pct": boss_pct,
+        "missing_boss_count": len(missing_boss_indices),
+        "missing_boss_indices": missing_boss_indices[:10],
+        "emoji_violations_count": len(emoji_violations),
+        "emoji_violations": emoji_violations[:10],
+        "emoji_free_pct": emoji_free_pct,
+        "is_fully_compliant": (boss_pct >= 95.0 and len(emoji_violations) == 0)
+    }
+
+
 def validate_chatml_entry(entry: Dict[str, Any], index: int = 0) -> List[str]:
     """
     Validates a single ChatML format JSON object.
-    
-    Returns:
-        List of error strings found in this entry.
     """
     errors = []
 
-    # Check for ChatML format
     if "messages" in entry:
         messages = entry.get("messages")
         if not isinstance(messages, list):
@@ -73,7 +217,6 @@ def validate_chatml_entry(entry: Dict[str, Any], index: int = 0) -> List[str]:
         if not has_assistant:
             errors.append(f"Row {index}: Missing 'assistant' message")
 
-    # Check for Gemini format
     elif "contents" in entry:
         contents = entry.get("contents")
         if not isinstance(contents, list) or len(contents) < 2:
@@ -111,9 +254,6 @@ def validate_chatml_entry(entry: Dict[str, Any], index: int = 0) -> List[str]:
 def validate_jsonl_dataset(jsonl_path: str) -> Dict[str, Any]:
     """
     Validates an entire .jsonl file, gathering statistics and checking for duplicates or format violations.
-    
-    Returns:
-        Dictionary with status, statistics, errors, and warnings.
     """
     if not os.path.exists(jsonl_path):
         return {
@@ -133,6 +273,9 @@ def validate_jsonl_dataset(jsonl_path: str) -> Dict[str, Any]:
     total_token_counts = []
     user_prompts_seen = Counter()
     categories_counter = Counter()
+    level_counter = Counter()
+    emoji_count = 0
+    boss_count = 0
 
     with open(jsonl_path, 'r', encoding='utf-8') as f:
         for idx, line in enumerate(f, start=1):
@@ -151,7 +294,6 @@ def validate_jsonl_dataset(jsonl_path: str) -> Dict[str, Any]:
             row_errors = validate_chatml_entry(record, index=idx)
             errors.extend(row_errors)
 
-            # Gather token and content statistics
             if "messages" in record:
                 user_text = ""
                 assistant_text = ""
@@ -173,9 +315,17 @@ def validate_jsonl_dataset(jsonl_path: str) -> Dict[str, Any]:
                 if cleaned_u:
                     user_prompts_seen[cleaned_u] += 1
 
+                if has_emojis(assistant_text):
+                    emoji_count += 1
+
+                if re.search(r'\bboss\b', assistant_text.lower()):
+                    boss_count += 1
+
                 meta = record.get("_metadata", {})
                 cat = meta.get("category", "Uncategorized")
+                lvl = meta.get("level", "Unspecified")
                 categories_counter[cat] += 1
+                level_counter[lvl] += 1
 
             elif "contents" in record:
                 u_text = " ".join([p.get("text", "") for t in record["contents"] if t.get("role") == "user" for p in t.get("parts", [])])
@@ -185,6 +335,11 @@ def validate_jsonl_dataset(jsonl_path: str) -> Dict[str, Any]:
                 user_token_counts.append(u_tok)
                 assistant_token_counts.append(m_tok)
                 total_token_counts.append(u_tok + m_tok)
+
+                if has_emojis(m_text):
+                    emoji_count += 1
+                if re.search(r'\bboss\b', m_text.lower()):
+                    boss_count += 1
 
     # Check duplicates
     duplicate_count = 0
@@ -197,17 +352,19 @@ def validate_jsonl_dataset(jsonl_path: str) -> Dict[str, Any]:
     if duplicate_count > 5:
         warnings.append(f"... and {duplicate_count - 5} more duplicate user prompts.")
 
-    # Calculate statistics
     stats = {
         "total_records": total_records,
         "duplicate_prompts": duplicate_count,
         "categories": dict(categories_counter),
+        "levels": dict(level_counter),
         "total_tokens_sum": sum(total_token_counts),
         "avg_tokens_per_example": round(sum(total_token_counts) / max(total_records, 1), 1),
         "max_tokens_example": max(total_token_counts) if total_token_counts else 0,
         "min_tokens_example": min(total_token_counts) if total_token_counts else 0,
         "avg_user_tokens": round(sum(user_token_counts) / max(total_records, 1), 1),
-        "avg_assistant_tokens": round(sum(assistant_token_counts) / max(total_records, 1), 1)
+        "avg_assistant_tokens": round(sum(assistant_token_counts) / max(total_records, 1), 1),
+        "boss_presence_pct": round((boss_count / max(total_records, 1)) * 100, 1),
+        "emoji_violations_count": emoji_count
     }
 
     is_valid = (len(errors) == 0 and total_records > 0)
@@ -240,11 +397,18 @@ def print_dataset_summary(validation_report: Dict[str, Any], title: str = "Datas
     print(f"Avg Tokens/Example: {stats.get('avg_tokens_per_example', 0)} (User: {stats.get('avg_user_tokens', 0)} | Assistant: {stats.get('avg_assistant_tokens', 0)})")
     print(f"Min / Max Tokens: {stats.get('min_tokens_example', 0)} / {stats.get('max_tokens_example', 0)}")
     print(f"Duplicate Prompts: {stats.get('duplicate_prompts', 0)}")
+    print(f"RotBot 'boss' Compliance: {stats.get('boss_presence_pct', 0)}%")
+    print(f"Emoji Violations: {stats.get('emoji_violations_count', 0)}")
 
     if stats.get("categories"):
         print("\n[+] Category Distribution:")
         for cat, cnt in stats["categories"].items():
             print(f"  - {cat}: {cnt} examples ({cnt / max(stats.get('total_records', 1), 1) * 100:.1f}%)")
+
+    if stats.get("levels"):
+        print("\n[+] Level Distribution:")
+        for lvl, cnt in stats["levels"].items():
+            print(f"  - {lvl}: {cnt} examples ({cnt / max(stats.get('total_records', 1), 1) * 100:.1f}%)")
 
     if warnings:
         print(f"\n[!] Warnings ({len(warnings)}):")
